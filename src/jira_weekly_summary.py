@@ -3,22 +3,19 @@
 
 import os
 import json
-import smtplib
-import requests
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
 from datetime import datetime, timezone
+import requests
 import anthropic
 
 # ── Config ───────────────────────────────────────────────────────────────────
-JIRA_BASE_URL      = "https://skyflow.atlassian.net"
-JIRA_EMAIL         = os.environ["JIRA_EMAIL"]
-JIRA_API_TOKEN     = os.environ["JIRA_API_TOKEN"]
-FILTER_ID          = "12006"
+JIRA_BASE_URL    = "https://skyflow.atlassian.net"
+JIRA_EMAIL       = os.environ["JIRA_EMAIL"]
+JIRA_API_TOKEN   = os.environ["JIRA_API_TOKEN"]
+FILTER_ID        = "12006"
 
-GMAIL_USER         = os.environ["GMAIL_USER"]
-GMAIL_APP_PASSWORD = os.environ["GMAIL_APP_PASSWORD"]
-RECIPIENT_EMAIL    = os.environ.get("RECIPIENT_EMAIL", "travis.perullo@skyflow.com")
+SENDGRID_API_KEY = os.environ["SENDGRID_API_KEY"]
+SENDER_EMAIL     = os.environ.get("SENDER_EMAIL", "travis.perullo@skyflow.com")
+RECIPIENT_EMAIL  = os.environ.get("RECIPIENT_EMAIL", "travis.perullo@skyflow.com")
 
 # ── Jira helpers ──────────────────────────────────────────────────────────────
 
@@ -213,17 +210,24 @@ def send_email(html_body: str):
     subject = f"Weekly Account Summary — {today}"
     html_full = _HTML_WRAPPER.format(date=today, body=html_body)
 
-    msg = MIMEMultipart("alternative")
-    msg["Subject"] = subject
-    msg["From"]    = GMAIL_USER
-    msg["To"]      = RECIPIENT_EMAIL
-    msg.attach(MIMEText("Please view this email in an HTML-capable client.", "plain"))
-    msg.attach(MIMEText(html_full, "html"))
-
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
-        server.login(GMAIL_USER, GMAIL_APP_PASSWORD)
-        server.sendmail(GMAIL_USER, RECIPIENT_EMAIL, msg.as_string())
-
+    resp = requests.post(
+        "https://api.sendgrid.com/v3/mail/send",
+        headers={
+            "Authorization": f"Bearer {SENDGRID_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "personalizations": [{"to": [{"email": RECIPIENT_EMAIL}]}],
+            "from": {"email": SENDER_EMAIL, "name": "Jira Weekly Summary"},
+            "subject": subject,
+            "content": [
+                {"type": "text/plain", "value": "Please view this email in an HTML-capable client."},
+                {"type": "text/html",  "value": html_full},
+            ],
+        },
+        timeout=30,
+    )
+    resp.raise_for_status()
     print(f"Summary sent to {RECIPIENT_EMAIL}")
 
 
