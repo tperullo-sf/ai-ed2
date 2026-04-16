@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Jira weekly account summary agent for CPM."""
+"""Jira weekly account summary agent for CPM — Slack delivery."""
 
 import os
 import json
@@ -8,14 +8,13 @@ import requests
 import anthropic
 
 # ── Config ───────────────────────────────────────────────────────────────────
-JIRA_BASE_URL    = "https://skyflow.atlassian.net"
-JIRA_EMAIL       = os.environ["JIRA_EMAIL"]
-JIRA_API_TOKEN   = os.environ["JIRA_API_TOKEN"]
-FILTER_ID        = "12006"
+JIRA_BASE_URL  = "https://skyflow.atlassian.net"
+JIRA_EMAIL     = os.environ["JIRA_EMAIL"]
+JIRA_API_TOKEN = os.environ["JIRA_API_TOKEN"]
+FILTER_ID      = "12006"
 
-SENDGRID_API_KEY = os.environ["SENDGRID_API_KEY"]
-SENDER_EMAIL     = os.environ.get("SENDER_EMAIL", "travis.perullo@skyflow.com")
-RECIPIENT_EMAIL  = os.environ.get("RECIPIENT_EMAIL", "travis.perullo@skyflow.com")
+SLACK_BOT_TOKEN = os.environ["SLACK_BOT_TOKEN"]
+SLACK_USER_ID   = os.environ["SLACK_USER_ID"]   # e.g. U01234567
 
 # ── Jira helpers ──────────────────────────────────────────────────────────────
 
@@ -68,7 +67,6 @@ def format_issue(issue):
     """Convert a raw Jira issue into a clean dict for the prompt."""
     f = issue["fields"]
 
-    # Recent comments — last 5, most recent first
     raw_comments = (f.get("comment") or {}).get("comments", [])
     comments = []
     for c in raw_comments[-5:]:
@@ -78,7 +76,6 @@ def format_issue(issue):
         if body:
             comments.append(f"[{date}] {author}: {body}")
 
-    # Linked issues
     links = []
     for lnk in f.get("issuelinks") or []:
         for direction in ("outwardIssue", "inwardIssue"):
@@ -94,7 +91,6 @@ def format_issue(issue):
                     ),
                 })
 
-    # Sub-tasks
     subtasks = []
     for st in (f.get("subtasks") or [])[:10]:
         subtasks.append({
@@ -131,30 +127,35 @@ Skyflow — a data privacy and tokenization company. Travis manages customer rel
 needs a clear, scannable digest to understand portfolio health, prioritize his week, and identify \
 where help is needed.
 
-Format guidelines:
+Guidelines:
 - Write for a CPM audience: business impact first, light on deep technical detail
-- Assign a health indicator to each account: 🟢 On Track · 🟡 Needs Attention · 🔴 At Risk
-- Infer health from ticket statuses, priorities, comment sentiment, overdue items, and recent activity
-- If an account has no recent activity, note it as quiet/stable rather than guessing at risks
-- Keep each section tight — this is a scan document, not a deep-dive report
-- Link tickets in Markdown: [KEY](url) · Status — no need to explain each ticket
+- Assign a health indicator: 🟢 On Track · 🟡 Needs Attention · 🔴 At Risk
+- Infer health from ticket statuses, priorities, comment sentiment, overdue items, and activity
+- If an account has no recent activity, note it as quiet/stable
+- Keep each section tight — this is a scan document, not a deep-dive
 
-Output must be valid HTML suitable for an email client (inline styles only, no external CSS).
+Output ONLY a valid JSON object — no markdown fences, no prose outside the JSON.
+Schema:
+{
+  "executive_summary": "<2-3 sentence overview of overall portfolio health>",
+  "accounts": [
+    {
+      "name": "<account name>",
+      "health": "<🟢 | 🟡 | 🔴>",
+      "current_status": "<1-2 sentences>",
+      "next_steps": ["<step>", ...],
+      "help_needed": ["<item>"],   // empty array if none
+      "recent_tickets": [
+        {"key": "<KEY-123>", "url": "<url>", "status": "<status>"}
+      ]
+    }
+  ]
+}
+Keep next_steps to 3-4 items. Keep recent_tickets to the most relevant 5 or fewer."""
 
-Structure:
-1. Executive summary paragraph at the top — 2–3 sentences covering overall portfolio health
-2. One <section> per account:
-   - <h2> with the account name and health indicator emoji
-   - <p><strong>Current Status:</strong> 1–2 sentences</p>
-   - <p><strong>Next Steps:</strong></p><ul>…3–4 bullet points…</ul>
-   - <p><strong>Help Needed / Risks:</strong></p><ul>…bullets, or <em>None</em>…</ul>
-   - <p><strong>Recent Tickets:</strong></p><ul>…linked list, key + status only…</ul>
-3. <hr> between accounts
-"""
 
-
-def generate_summary(issues_data: list) -> str:
-    """Call Claude to produce the HTML weekly summary."""
+def generate_summary(issues_data: list) -> dict:
+    """Call Claude and return the parsed summary dict."""
     client = anthropic.Anthropic()
     today = datetime.now(timezone.utc).strftime("%B %d, %Y")
 
@@ -171,7 +172,7 @@ def generate_summary(issues_data: list) -> str:
             {
                 "type": "text",
                 "text": SYSTEM_PROMPT,
-                "cache_control": {"type": "ephemeral"},  # cache stable system prompt
+                "cache_control": {"type": "ephemeral"},
             }
         ],
         messages=[{"role": "user", "content": user_content}],
@@ -180,55 +181,98 @@ def generate_summary(issues_data: list) -> str:
 
     for block in message.content:
         if block.type == "text":
-            return block.text
+            return json.loads(block.text)
 
     raise RuntimeError("Claude returned no text block in the response")
 
 
-# ── Email ─────────────────────────────────────────────────────────────────────
+# ── Slack delivery ────────────────────────────────────────────────────────────
 
-_HTML_WRAPPER = """\
-<!DOCTYPE html>
-<html>
-<body style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;\
-font-size:15px;line-height:1.6;color:#1a1a1a;max-width:820px;margin:0 auto;padding:24px;">
-  <h1 style="color:#0052cc;border-bottom:2px solid #0052cc;padding-bottom:8px;margin-bottom:24px;">
-    Skyflow Weekly Account Summary &mdash; {date}
-  </h1>
-  {body}
-  <hr style="margin-top:40px;border:none;border-top:1px solid #ddd;">
-  <p style="font-size:12px;color:#888;margin-top:8px;">
-    Auto-generated from Jira filter 12006 &middot; {date}
-  </p>
-</body>
-</html>
-"""
-
-
-def send_email(html_body: str):
-    today = datetime.now(timezone.utc).strftime("%B %d, %Y")
-    subject = f"Weekly Account Summary — {today}"
-    html_full = _HTML_WRAPPER.format(date=today, body=html_body)
-
+def _slack_post(endpoint: str, payload: dict) -> dict:
     resp = requests.post(
-        "https://api.sendgrid.com/v3/mail/send",
-        headers={
-            "Authorization": f"Bearer {SENDGRID_API_KEY}",
-            "Content-Type": "application/json",
-        },
-        json={
-            "personalizations": [{"to": [{"email": RECIPIENT_EMAIL}]}],
-            "from": {"email": SENDER_EMAIL, "name": "Jira Weekly Summary"},
-            "subject": subject,
-            "content": [
-                {"type": "text/plain", "value": "Please view this email in an HTML-capable client."},
-                {"type": "text/html",  "value": html_full},
-            ],
-        },
+        f"https://slack.com/api/{endpoint}",
+        headers={"Authorization": f"Bearer {SLACK_BOT_TOKEN}"},
+        json=payload,
         timeout=30,
     )
     resp.raise_for_status()
-    print(f"Summary sent to {RECIPIENT_EMAIL}")
+    data = resp.json()
+    if not data.get("ok"):
+        raise RuntimeError(f"Slack API error on {endpoint}: {data.get('error')}")
+    return data
+
+
+def build_blocks(summary: dict, today: str) -> list:
+    """Convert the summary dict into Slack Block Kit blocks."""
+    blocks = [
+        {
+            "type": "header",
+            "text": {"type": "plain_text", "text": f"📋 Weekly Account Summary — {today}"},
+        },
+        {
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": summary["executive_summary"]},
+        },
+        {"type": "divider"},
+    ]
+
+    for acct in summary.get("accounts", []):
+        # Account header line
+        name_line = f"{acct['health']} *{acct['name']}*"
+
+        # Body text — built in sections to stay under Slack's 3000-char block limit
+        status_text = f"*Current Status:* {acct['current_status']}"
+
+        steps = acct.get("next_steps") or []
+        steps_text = "*Next Steps:*\n" + "\n".join(f"• {s}" for s in steps) if steps else ""
+
+        risks = acct.get("help_needed") or []
+        risks_text = (
+            "*Help Needed / Risks:*\n" + "\n".join(f"• {r}" for r in risks)
+            if risks
+            else "*Help Needed / Risks:* None"
+        )
+
+        tickets = acct.get("recent_tickets") or []
+        if tickets:
+            ticket_lines = "\n".join(
+                f"• <{t['url']}|{t['key']}> · {t['status']}" for t in tickets
+            )
+            tickets_text = f"*Recent Tickets:*\n{ticket_lines}"
+        else:
+            tickets_text = ""
+
+        body_parts = [p for p in [status_text, steps_text, risks_text, tickets_text] if p]
+        body_text = "\n\n".join(body_parts)
+
+        blocks.append({
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": f"{name_line}\n\n{body_text}"[:3000]},
+        })
+        blocks.append({"type": "divider"})
+
+    return blocks
+
+
+def send_slack_dm(summary: dict):
+    today = datetime.now(timezone.utc).strftime("%B %d, %Y")
+
+    # Open (or reuse) a DM channel with the user
+    dm = _slack_post("conversations.open", {"users": SLACK_USER_ID})
+    channel_id = dm["channel"]["id"]
+
+    blocks = build_blocks(summary, today)
+
+    # Slack allows max 50 blocks per message; split if needed
+    chunk_size = 50
+    for i in range(0, len(blocks), chunk_size):
+        _slack_post("chat.postMessage", {
+            "channel": channel_id,
+            "text": f"Weekly Account Summary — {today}",  # fallback for notifications
+            "blocks": blocks[i : i + chunk_size],
+        })
+
+    print(f"Summary sent to Slack DM for user {SLACK_USER_ID}")
 
 
 # ── Entrypoint ────────────────────────────────────────────────────────────────
@@ -241,10 +285,10 @@ def main():
     issues_data = [format_issue(i) for i in raw_issues]
 
     print("Generating summary with Claude…")
-    html_summary = generate_summary(issues_data)
+    summary = generate_summary(issues_data)
 
-    print("Sending email…")
-    send_email(html_summary)
+    print("Sending to Slack…")
+    send_slack_dm(summary)
     print("Done.")
 
 
